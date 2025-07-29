@@ -952,6 +952,132 @@ func partialDeadline(now, deadline time.Time, addrsRemaining int) (time.Time, er
 	return now.Add(timeout), nil
 }
 
+// HostRecord represents a DNS record with IP address and TTL
+type HostRecord struct {
+	IP  string `json:"ip"`
+	TTL uint32 `json:"ttl"`
+}
+
+// LookupContextHostWithIPVersion performs host lookup with forced IP version
+// ipv4Only: if true, only perform IPv4 (A record) lookup
+//
+//	if false, only perform IPv6 (AAAA record) lookup
+func (tnet *Net) LookupContextHostWithIPVersion(ctx context.Context, host string, ipv4Only bool) ([]HostRecord, error) {
+	if host == "" || len(tnet.dnsServers) == 0 {
+		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
+	}
+
+	zlen := len(host)
+	if strings.IndexByte(host, ':') != -1 {
+		if zidx := strings.LastIndexByte(host, '%'); zidx != -1 {
+			zlen = zidx
+		}
+	}
+	if ip, err := netip.ParseAddr(host[:zlen]); err == nil {
+		// If parsing succeeds, check if the IP version matches what was requested
+		if (ip.Is4() && ipv4Only) || (ip.Is6() && !ipv4Only) {
+			return []HostRecord{{IP: ip.String(), TTL: 0}}, nil
+		}
+		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
+	}
+
+	if !isDomainName(host) {
+		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
+	}
+
+	var queryType dnsmessage.Type
+	if ipv4Only {
+		queryType = dnsmessage.TypeA
+	} else {
+		queryType = dnsmessage.TypeAAAA
+	}
+
+	p, server, err := tnet.tryOneName(ctx, host+".", queryType)
+	if err != nil {
+		return nil, err
+	}
+
+	var addrs []HostRecord
+	for {
+		h, err := p.AnswerHeader()
+		if err != nil && err != dnsmessage.ErrSectionDone {
+			return nil, &net.DNSError{
+				Err:    errCannotMarshalDNSMessage.Error(),
+				Name:   host,
+				Server: server,
+			}
+		}
+		if err != nil {
+			break
+		}
+
+		switch h.Type {
+		case dnsmessage.TypeA:
+			if ipv4Only {
+				a, err := p.AResource()
+				if err != nil {
+					return nil, &net.DNSError{
+						Err:    errCannotMarshalDNSMessage.Error(),
+						Name:   host,
+						Server: server,
+					}
+				}
+				addrs = append(addrs, HostRecord{
+					IP:  netip.AddrFrom4(a.A).String(),
+					TTL: h.TTL,
+				})
+			} else {
+				if err := p.SkipAnswer(); err != nil {
+					return nil, &net.DNSError{
+						Err:    errCannotMarshalDNSMessage.Error(),
+						Name:   host,
+						Server: server,
+					}
+				}
+			}
+
+		case dnsmessage.TypeAAAA:
+			if !ipv4Only {
+				aaaa, err := p.AAAAResource()
+				if err != nil {
+					return nil, &net.DNSError{
+						Err:    errCannotMarshalDNSMessage.Error(),
+						Name:   host,
+						Server: server,
+					}
+				}
+				addrs = append(addrs, HostRecord{
+					IP:  netip.AddrFrom16(aaaa.AAAA).String(),
+					TTL: h.TTL,
+				})
+			} else {
+				if err := p.SkipAnswer(); err != nil {
+					return nil, &net.DNSError{
+						Err:    errCannotMarshalDNSMessage.Error(),
+						Name:   host,
+						Server: server,
+					}
+				}
+			}
+
+		default:
+			if err := p.SkipAnswer(); err != nil {
+				return nil, &net.DNSError{
+					Err:    errCannotMarshalDNSMessage.Error(),
+					Name:   host,
+					Server: server,
+				}
+			}
+		}
+	}
+
+	if len(addrs) == 0 {
+		return []HostRecord{}, nil
+	}
+
+	return addrs, nil
+}
+
 var protoSplitter = regexp.MustCompile(`^(tcp|udp|ping)(4|6)?$`)
 
 func (tnet *Net) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
