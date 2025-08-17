@@ -981,6 +981,14 @@ func (tnet *Net) LookupContextHostWithIPVersion(ctx context.Context, host string
 		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
 	}
 
+	// If requesting A/AAAA but the network lacks IPv4/IPv6 support, return empty result.
+	if ipv4Only && !tnet.hasV4 {
+		return []HostRecord{}, nil
+	}
+	if !ipv4Only && !tnet.hasV6 {
+		return []HostRecord{}, nil
+	}
+
 	if !isDomainName(host) {
 		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
 	}
